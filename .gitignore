@@ -1,0 +1,22 @@
+# Ignore dataset directory
+dataset/
+
+# Ignore Python cache and virtual environment directories
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python/
+venv/
+env/
+.env
+
+# Ignore temporary files
+*~
+*.swp
+*.bak
+*.tmp
+*.log
+
+# Ignore Jupyter Notebook-specific files
+.ipynb_checkpoints/

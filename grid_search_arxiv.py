@@ -9,7 +9,7 @@ import pandas as pd
 from datetime import datetime
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, GraphNorm
 import torch_geometric.transforms as T
 from ogb.nodeproppred import Evaluator
 from ogb.nodeproppred import NodePropPredDataset
@@ -18,37 +18,36 @@ from ogb.nodeproppred import NodePropPredDataset
 # 1. CONFIGURATION & DIRECTORIES
 # ==========================================
 
-# Suppress PyTorch weights_only warning
+# Suppress warnings
 import warnings
 warnings.filterwarnings("ignore", message=".*weights_only=False.*")
 
-# Define output structure
+# Output structure
 OUTPUT_ROOT = 'outputs'
 MODELS_DIR = os.path.join(OUTPUT_ROOT, 'models')
 LOGS_DIR = os.path.join(OUTPUT_ROOT, 'logs')
 LOG_FILE = os.path.join(OUTPUT_ROOT, 'experiments_log.csv')
 
-# Ensure directories exist
 for folder in [OUTPUT_ROOT, MODELS_DIR, LOGS_DIR]:
     if not os.path.exists(folder):
         os.makedirs(folder)
-        print(f"Created directory: {folder}")
 
-# Hyperparameter Grid (As requested)
+# --- HYPERPARAMETER GRID (UPDATED) ---
 param_grid = {
     # Architecture
-    'num_layers': [2, 3, 4],             # GCNs work best with few layers (2 or 3)
-    'hidden_dim': [128, 256, 512, 1024], # 128 is baseline, 256/512 increase capacity
+    'num_layers': [3, 4],                # Now we can try deeper nets thanks to residuals
+    'hidden_dim': [256, 512],  # Wider layers for better capacity     
+    'use_residual': [True, False],       # Grid search will test with and without Skip Connections
+    'norm_type': ['batch', 'layer', 'graph'],    
     
     # Optimization
-    'lr': [0.01, 0.005],           # 0.01 is standard, 0.005 for refining
+    'lr': [0.01],                        # Fixed to reduce combinations (Scheduler handles dynamics)
+    'dropout': [0.5],                    # Fixed (0.5 is usually best for arxiv)
+    'drop_edge_p': [0.0, 0.2],               # Edge Dropout for regularization
+    'weight_decay': [0, 5e-4],           
     
-    # Regularization (CRITICAL for ogbn-arxiv)
-    'dropout': [0.3, 0.5],         # 0.5 prevents memorizing old data
-    'weight_decay': [0, 5e-4],     # 5e-4 is the "magic" value from the original GCN paper
-    
-    # Fixed settings
-    'epochs': [2]                  # Note: 2 is very low, usually 200-500 for full training
+    # Training
+    'epochs': [500]                      # High ceiling for Early Stopping
 }
 
 # Fixed settings
@@ -56,37 +55,66 @@ PATIENCE = 50
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # ==========================================
-# 2. MODEL DEFINITION (GCN)
+# 2. MODEL DEFINITION (ADVANCED GCN)
 # ==========================================
 
 class GCN(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, dropout):
+    # 1. Adicionar drop_edge_p no init
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, dropout, 
+                 norm_type='batch', use_residual=False, drop_edge_p=0.0):
         super(GCN, self).__init__()
         
         self.convs = torch.nn.ModuleList()
-        self.bns = torch.nn.ModuleList()
+        self.norms = torch.nn.ModuleList()
         self.dropout = dropout
+        self.use_residual = use_residual
+        self.drop_edge_p = drop_edge_p  # Guardar o valor
 
-        # Input Layer
+        def get_norm(dim):
+            if norm_type == 'batch': return torch.nn.BatchNorm1d(dim)
+            elif norm_type == 'layer': return torch.nn.LayerNorm(dim)
+            elif norm_type == 'graph': return GraphNorm(dim)
+            else: return torch.nn.Identity()
+
         self.convs.append(GCNConv(input_dim, hidden_dim))
-        self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+        self.norms.append(get_norm(hidden_dim))
 
-        # Hidden Layers
         for _ in range(num_layers - 2):
             self.convs.append(GCNConv(hidden_dim, hidden_dim))
-            self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+            self.norms.append(get_norm(hidden_dim))
 
-        # Output Layer
         self.convs.append(GCNConv(hidden_dim, output_dim))
 
     def forward(self, x, adj_t):
-        for i, conv in enumerate(self.convs[:-1]):
-            x = conv(x, adj_t)
-            x = self.bns[i](x)
+        # --- APLICAÇÃO DO DROPEDGE ---
+        # Só aplicamos se estiver treinando e se o p > 0
+        edge_index_to_use = adj_t
+        if self.training and self.drop_edge_p > 0.0:
+            # O método .dropout() do SparseTensor retorna uma nova matriz esparsa
+            # com valores removidos aleatoriamente.
+            edge_index_to_use = adj_t.dropout(p=self.drop_edge_p)
+            
+        # 1. Input Layer
+        # Note que usamos edge_index_to_use agora, não mais adj_t direto
+        x = self.convs[0](x, edge_index_to_use)
+        x = self.norms[0](x)
+        x = F.relu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        # 2. Hidden Layers
+        for i in range(len(self.convs) - 2):
+            x_in = x 
+            
+            x = self.convs[i+1](x, edge_index_to_use) # Usando arestas dropadas
+            x = self.norms[i+1](x)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
             
-        x = self.convs[-1](x, adj_t)
+            if self.use_residual:
+                x = x + x_in
+
+        # 3. Output Layer
+        x = self.convs[-1](x, edge_index_to_use) # Usando arestas dropadas
         return F.log_softmax(x, dim=1)
 
 # ==========================================
@@ -134,16 +162,11 @@ def test(model, data, split_idx, evaluator):
     return train_acc, valid_acc, test_acc
 
 def save_experiment_log(args, results, log_file):
-    """Saves results with 'args' grouped in a single column."""
     entry = results.copy()
-    entry['args'] = str(args) # Convert dict to string
-    
+    entry['args'] = str(args)
     df = pd.DataFrame([entry])
-    
-    # Reorder columns
     cols = [c for c in df.columns if c != 'args'] + ['args']
     df = df[cols]
-    
     if not os.path.isfile(log_file):
         df.to_csv(log_file, index=False, header=True)
     else:
@@ -154,7 +177,6 @@ def save_experiment_log(args, results, log_file):
 # ==========================================
 
 print("Loading dataset...")
-# Note: Adjust root='dataset' if your data is in a different folder
 dataset = NodePropPredDataset(name='ogbn-arxiv', root='dataset') 
 graph, labels = dataset[0]
 split_idx = dataset.get_idx_split()
@@ -164,10 +186,7 @@ x = torch.from_numpy(graph['node_feat']).to(torch.float)
 y = torch.from_numpy(labels).to(torch.long).squeeze(1)
 edge_index = torch.from_numpy(graph['edge_index']).to(torch.long)
 
-# --- FIX: Using the imported Data class properly ---
 data = Data(x=x, y=y, edge_index=edge_index)
-
-# Apply Transformations
 data = T.ToUndirected()(data)
 data = T.ToSparseTensor()(data)
 
@@ -190,25 +209,36 @@ experiments = [dict(zip(keys, v)) for v in itertools.product(*values)]
 
 print(f"\n--- Starting Grid Search ({len(experiments)} configs) ---")
 print(f"Results will be saved to: {OUTPUT_ROOT}/")
-print(f"Device: {DEVICE}")
 
 for i, args in enumerate(experiments):
     print(f"\n[{i+1}/{len(experiments)}] Config: {args}")
     set_seed(42)
     
-    # Initialize Model & Optimizer
-    model = GCN(input_dim, args['hidden_dim'], output_dim, args['num_layers'], args['dropout']).to(DEVICE)
+    # 1. Initialize Model with new params (norm_type, use_residual)
+    model = GCN(input_dim, 
+                args['hidden_dim'], 
+                output_dim, 
+                args['num_layers'], 
+                args['dropout'],
+                norm_type=args['norm_type'],
+                use_residual=args['use_residual'],
+                drop_edge_p=args['drop_edge_p'] 
+                ).to(DEVICE)
+    
+    # 2. Optimizer & Scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=args['lr'], weight_decay=args['weight_decay'])
     criterion = torch.nn.NLLLoss()
+    
+    # Cosine Annealing Scheduler (NEW!)
+    # Starts at args['lr'] and goes down to 0.001
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args['epochs'], eta_min=0.001)
     
     # Experiment Identifiers
     experiment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_filename = f"gcn_arxiv_{experiment_id}.pth"
     save_path = os.path.join(MODELS_DIR, model_filename)
     
-    # History tracking
     history = {'train_loss': [], 'train_acc': [], 'valid_acc': [], 'test_acc': []}
-    
     best_valid_acc = 0
     best_test_acc = 0
     patience_counter = 0
@@ -216,18 +246,19 @@ for i, args in enumerate(experiments):
     
     start_time = time.time()
     
-    # Training Loop
+    # 3. Training Loop
     for epoch in range(1, args['epochs'] + 1):
         loss = train(model, data, train_idx, optimizer, criterion)
         train_acc, valid_acc, test_acc = test(model, data, split_idx, evaluator)
         
-        # Collect History
+        # Step the scheduler
+        scheduler.step()
+        
         history['train_loss'].append(loss)
         history['train_acc'].append(train_acc)
         history['valid_acc'].append(valid_acc)
         history['test_acc'].append(test_acc)
         
-        # Early Stopping Logic
         if valid_acc > best_valid_acc:
             best_valid_acc = valid_acc
             best_test_acc = test_acc
@@ -245,26 +276,22 @@ for i, args in enumerate(experiments):
             
     duration = time.time() - start_time
     
-    # Calculate Results and Margin
     num_test = len(test_idx)
     margin = 1.96 * np.sqrt((best_test_acc * (1 - best_test_acc)) / num_test)
     print(f"   -> Result: Val={best_valid_acc:.4f}, Test={best_test_acc:.4f} ± {margin:.4f}")
     
     # --- SAVE RESULTS ---
-    
-    # 1. Save Detailed History (JSON)
     history_filename = f"history_{experiment_id}.json"
     history_path = os.path.join(LOGS_DIR, history_filename)
     
     with open(history_path, 'w') as f:
         json.dump(history, f)
         
-    # 2. Save Summary (CSV)
     results = {
         'experiment_id': experiment_id,
         'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'model_file': save_path,
-        'history_file': history_path, # Link to JSON
+        'history_file': history_path,
         'duration_seconds': round(duration, 2),
         'actual_epochs': final_epoch,
         'best_valid_acc': best_valid_acc,
@@ -276,4 +303,3 @@ for i, args in enumerate(experiments):
     save_experiment_log(args, results, LOG_FILE)
 
 print("\n--- Grid Search Complete ---")
-print(f"Summary log: {LOG_FILE}")

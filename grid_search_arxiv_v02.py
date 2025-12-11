@@ -49,7 +49,7 @@ param_grid = {
     'weight_decay': [0, 5e-4],           
     
     # Training
-    'epochs': [1]                      
+    'epochs': [1000]                      
 }
 
 # Fixed settings

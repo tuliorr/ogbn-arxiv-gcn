@@ -1,20 +1,26 @@
+import os
+import json
+import time
 import torch
+import random
+import itertools
+import numpy as np
+import pandas as pd
+from datetime import datetime
 import torch.nn.functional as F
+from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
 import torch_geometric.transforms as T
-from ogb.nodeproppred import NodePropPredDataset, Evaluator
-import pandas as pd
-import numpy as np
-import os
-import itertools
-import time
-from datetime import datetime
-import random
-import json
+from ogb.nodeproppred import Evaluator
+from ogb.nodeproppred import NodePropPredDataset
 
 # ==========================================
 # 1. CONFIGURATION & DIRECTORIES
 # ==========================================
+
+# Suppress PyTorch weights_only warning
+import warnings
+warnings.filterwarnings("ignore", message=".*weights_only=False.*")
 
 # Define output structure
 OUTPUT_ROOT = 'outputs'
@@ -28,7 +34,7 @@ for folder in [OUTPUT_ROOT, MODELS_DIR, LOGS_DIR]:
         os.makedirs(folder)
         print(f"Created directory: {folder}")
 
-# Hyperparameter Grid
+# Hyperparameter Grid (As requested)
 param_grid = {
     # Architecture
     'num_layers': [2, 3, 4],             # GCNs work best with few layers (2 or 3)
@@ -41,8 +47,8 @@ param_grid = {
     'dropout': [0.3, 0.5],         # 0.5 prevents memorizing old data
     'weight_decay': [0, 5e-4],     # 5e-4 is the "magic" value from the original GCN paper
     
-    # Fixed (do not vary in grid, keep it fixed in the loop)
-    'epochs': [500]                # Early stopping will cut it short, set high ceiling
+    # Fixed settings
+    'epochs': [2]                  # Note: 2 is very low, usually 200-500 for full training
 }
 
 # Fixed settings
@@ -148,7 +154,7 @@ def save_experiment_log(args, results, log_file):
 # ==========================================
 
 print("Loading dataset...")
-# Note: Check if you need '../dataset' or just 'dataset'
+# Note: Adjust root='dataset' if your data is in a different folder
 dataset = NodePropPredDataset(name='ogbn-arxiv', root='dataset') 
 graph, labels = dataset[0]
 split_idx = dataset.get_idx_split()
@@ -158,9 +164,12 @@ x = torch.from_numpy(graph['node_feat']).to(torch.float)
 y = torch.from_numpy(labels).to(torch.long).squeeze(1)
 edge_index = torch.from_numpy(graph['edge_index']).to(torch.long)
 
-data = T.ToSparseTensor()(T.ToUndirected()(
-    T.Data(x=x, y=y, edge_index=edge_index)
-))
+# --- FIX: Using the imported Data class properly ---
+data = Data(x=x, y=y, edge_index=edge_index)
+
+# Apply Transformations
+data = T.ToUndirected()(data)
+data = T.ToSparseTensor()(data)
 
 data = data.to(DEVICE)
 train_idx = torch.from_numpy(split_idx['train']).to(DEVICE)
@@ -181,17 +190,18 @@ experiments = [dict(zip(keys, v)) for v in itertools.product(*values)]
 
 print(f"\n--- Starting Grid Search ({len(experiments)} configs) ---")
 print(f"Results will be saved to: {OUTPUT_ROOT}/")
+print(f"Device: {DEVICE}")
 
 for i, args in enumerate(experiments):
     print(f"\n[{i+1}/{len(experiments)}] Config: {args}")
     set_seed(42)
     
-    # Initialize
+    # Initialize Model & Optimizer
     model = GCN(input_dim, args['hidden_dim'], output_dim, args['num_layers'], args['dropout']).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=args['lr'], weight_decay=args['weight_decay'])
     criterion = torch.nn.NLLLoss()
     
-    # Experiment ID
+    # Experiment Identifiers
     experiment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_filename = f"gcn_arxiv_{experiment_id}.pth"
     save_path = os.path.join(MODELS_DIR, model_filename)
@@ -217,7 +227,7 @@ for i, args in enumerate(experiments):
         history['valid_acc'].append(valid_acc)
         history['test_acc'].append(test_acc)
         
-        # Early Stopping
+        # Early Stopping Logic
         if valid_acc > best_valid_acc:
             best_valid_acc = valid_acc
             best_test_acc = test_acc
@@ -235,7 +245,7 @@ for i, args in enumerate(experiments):
             
     duration = time.time() - start_time
     
-    # Metrics
+    # Calculate Results and Margin
     num_test = len(test_idx)
     margin = 1.96 * np.sqrt((best_test_acc * (1 - best_test_acc)) / num_test)
     print(f"   -> Result: Val={best_valid_acc:.4f}, Test={best_test_acc:.4f} ± {margin:.4f}")
@@ -266,3 +276,4 @@ for i, args in enumerate(experiments):
     save_experiment_log(args, results, LOG_FILE)
 
 print("\n--- Grid Search Complete ---")
+print(f"Summary log: {LOG_FILE}")

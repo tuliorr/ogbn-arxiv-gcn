@@ -9,7 +9,7 @@ import pandas as pd
 from datetime import datetime
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv, GraphNorm
+from torch_geometric.nn import GCNConv, GraphNorm, JumpingKnowledge
 import torch_geometric.transforms as T
 from ogb.nodeproppred import Evaluator
 from ogb.nodeproppred import NodePropPredDataset
@@ -26,7 +26,7 @@ warnings.filterwarnings("ignore", message=".*weights_only=False.*")
 OUTPUT_ROOT = 'outputs'
 MODELS_DIR = os.path.join(OUTPUT_ROOT, 'models')
 LOGS_DIR = os.path.join(OUTPUT_ROOT, 'logs')
-LOG_FILE = os.path.join(OUTPUT_ROOT, 'experiments_log.csv')
+LOG_FILE = os.path.join(OUTPUT_ROOT, 'experiments_log_v02.csv')
 
 # Ensure directories exist
 for folder in [OUTPUT_ROOT, MODELS_DIR, LOGS_DIR]:
@@ -35,21 +35,21 @@ for folder in [OUTPUT_ROOT, MODELS_DIR, LOGS_DIR]:
         print(f"Created directory: {folder}")
 
 # Hyperparameter Grid
-# REMOVED 'drop_edge_p' to fix AttributeError crashes
 param_grid = {
     # Architecture
-    'num_layers': [3, 4],                # Now we can try deeper nets thanks to residuals
-    'hidden_dim': [256, 512],            # Wider layers for better capacity     
-    'use_residual': [True, False],       # Grid search will test with and without Skip Connections
-    'norm_type': ['batch', 'layer', 'graph'], 
+    'num_layers': [3, 4],                
+    'hidden_dim': [256, 512],            
+    'use_residual': [True],              # Residual connections help deep GCNs
+    'use_jk': [True, False],             # NEW: Test Jumping Knowledge (concatenation)
+    'norm_type': ['batch', 'graph'],     # GraphNorm is usually better for GCNs
     
     # Optimization
-    'lr': [0.01],                        # Fixed
-    'dropout': [0.5],                    # Fixed
+    'lr': [0.01],                        
+    'dropout': [0.5],                    
     'weight_decay': [0, 5e-4],           
     
     # Training
-    'epochs': [500]                      # High ceiling for Early Stopping
+    'epochs': [1]                      
 }
 
 # Fixed settings
@@ -57,18 +57,26 @@ PATIENCE = 50
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # ==========================================
-# 2. MODEL DEFINITION (GCN)
+# 2. MODEL DEFINITION (MODERN GCN)
 # ==========================================
 
 class GCN(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers, dropout, 
-                 norm_type='batch', use_residual=False):
+                 norm_type='batch', use_residual=False, use_jk=False):
         super(GCN, self).__init__()
         
-        self.convs = torch.nn.ModuleList()
-        self.norms = torch.nn.ModuleList()
+        self.num_layers = num_layers
         self.dropout = dropout
         self.use_residual = use_residual
+        self.use_jk = use_jk
+
+        # 1. NODE ENCODER (Linear Layer)
+        # Transforms input (128) -> hidden (256/512) BEFORE the GCN layers.
+        # This creates a "Latent Feature Space" for the GCN to work on.
+        self.node_encoder = torch.nn.Linear(input_dim, hidden_dim)
+
+        self.convs = torch.nn.ModuleList()
+        self.norms = torch.nn.ModuleList()
 
         # Helper to select Norm layer
         def get_norm(dim):
@@ -77,40 +85,57 @@ class GCN(torch.nn.Module):
             elif norm_type == 'graph': return GraphNorm(dim)
             else: return torch.nn.Identity()
 
-        # Input Layer
-        self.convs.append(GCNConv(input_dim, hidden_dim))
-        self.norms.append(get_norm(hidden_dim))
-
-        # Hidden Layers
-        for _ in range(num_layers - 2):
+        # 2. GCN LAYERS
+        # Note: All layers now map hidden -> hidden (because of the encoder)
+        for _ in range(num_layers):
             self.convs.append(GCNConv(hidden_dim, hidden_dim))
             self.norms.append(get_norm(hidden_dim))
 
-        # Output Layer
-        self.convs.append(GCNConv(hidden_dim, output_dim))
+        # 3. JUMPING KNOWLEDGE
+        if use_jk:
+            # "cat": Concatenates outputs from all layers.
+            # Resulting dim = hidden_dim * num_layers
+            self.jk = JumpingKnowledge(mode='cat')
+            final_dim = hidden_dim * num_layers
+        else:
+            final_dim = hidden_dim
+
+        # 4. PREDICTION HEAD
+        self.pred_linear = torch.nn.Linear(final_dim, output_dim)
 
     def forward(self, x, adj_t):
-        # 1. Input Layer
-        x = self.convs[0](x, adj_t)
-        x = self.norms[0](x)
+        # Step 1: Encode Features
+        x = self.node_encoder(x)
         x = F.relu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
-        
-        # 2. Hidden Layers (with Residuals)
-        for i in range(len(self.convs) - 2):
-            x_in = x # Save input for residual connection
-            
-            x = self.convs[i+1](x, adj_t)
-            x = self.norms[i+1](x)
+
+        # List to store intermediate layer outputs (for JK)
+        xs = []
+
+        # Step 2: GCN Loop
+        for i in range(self.num_layers):
+            x_in = x # Save for residual
+
+            x = self.convs[i](x, adj_t)
+            x = self.norms[i](x)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
             
             # Apply Residual (Skip Connection)
             if self.use_residual:
                 x = x + x_in
+            
+            # Store result of this layer
+            xs.append(x)
 
-        # 3. Output Layer
-        x = self.convs[-1](x, adj_t)
+        # Step 3: Jumping Knowledge or Last Layer
+        if self.use_jk:
+            x = self.jk(xs) # Concatenate all layers [L1, L2, L3...]
+        else:
+            x = xs[-1]      # Take only the last layer
+
+        # Step 4: Final Prediction
+        x = self.pred_linear(x)
         return F.log_softmax(x, dim=1)
 
 # ==========================================
@@ -219,14 +244,15 @@ for i, args in enumerate(experiments):
     print(f"\n[{i+1}/{len(experiments)}] Config: {args}")
     set_seed(42)
     
-    # 1. Initialize Model (removed drop_edge_p)
+    # 1. Initialize Model
     model = GCN(input_dim, 
                 args['hidden_dim'], 
                 output_dim, 
                 args['num_layers'], 
                 args['dropout'],
                 norm_type=args['norm_type'],     
-                use_residual=args['use_residual']
+                use_residual=args['use_residual'],
+                use_jk=args['use_jk'] # NEW: Jumping Knowledge param
                ).to(DEVICE)
     
     # 2. Optimizer & Scheduler

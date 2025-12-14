@@ -1,3 +1,7 @@
+# Ignore training models and checkpoint directory
+# This is usually large and contains binary data
+models/
+
 # Ignore dataset directory
 dataset/
 

@@ -1,4 +1,5 @@
 import os
+import gc
 import json
 import time
 import torch
@@ -267,7 +268,18 @@ for i, args in enumerate(experiments):
             best_valid_acc = valid_acc
             best_test_acc = test_acc
             patience_counter = 0
-            torch.save(model.state_dict(), save_path)
+            if DEVICE == 'cuda':
+                torch.cuda.empty_cache()
+            gc.collect() 
+
+            try:
+                torch.save(model.state_dict(), save_path)
+            except RuntimeError as e:
+                print(f"\n[CRITICAL I/O WARNING] Failed to save checkpoint at {save_path}: {e}")
+            
+            if DEVICE == 'cuda':
+                torch.cuda.empty_cache()
+            gc.collect()
         else:
             patience_counter += 1
             

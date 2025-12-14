@@ -13,6 +13,7 @@ from torch_geometric.nn import GCNConv, GraphNorm, JumpingKnowledge
 import torch_geometric.transforms as T
 from ogb.nodeproppred import Evaluator
 from ogb.nodeproppred import NodePropPredDataset
+import gc # Import Garbage Collector for robust memory management
 
 # ==========================================
 # 1. CONFIGURATION & DIRECTORIES
@@ -26,7 +27,7 @@ warnings.filterwarnings("ignore", message=".*weights_only=False.*")
 OUTPUT_ROOT = 'outputs'
 MODELS_DIR = os.path.join(OUTPUT_ROOT, 'models')
 LOGS_DIR = os.path.join(OUTPUT_ROOT, 'logs')
-LOG_FILE = os.path.join(OUTPUT_ROOT, 'experiments_log_v02.csv')
+LOG_FILE = os.path.join(OUTPUT_ROOT, 'experiments_log_v02.csv') # Version 02 Log File
 
 # Ensure directories exist
 for folder in [OUTPUT_ROOT, MODELS_DIR, LOGS_DIR]:
@@ -72,7 +73,6 @@ class GCN(torch.nn.Module):
 
         # 1. NODE ENCODER (Linear Layer)
         # Transforms input (128) -> hidden (256/512) BEFORE the GCN layers.
-        # This creates a "Latent Feature Space" for the GCN to work on.
         self.node_encoder = torch.nn.Linear(input_dim, hidden_dim)
 
         self.convs = torch.nn.ModuleList()
@@ -94,7 +94,6 @@ class GCN(torch.nn.Module):
         # 3. JUMPING KNOWLEDGE
         if use_jk:
             # "cat": Concatenates outputs from all layers.
-            # Resulting dim = hidden_dim * num_layers
             self.jk = JumpingKnowledge(mode='cat')
             final_dim = hidden_dim * num_layers
         else:
@@ -108,7 +107,7 @@ class GCN(torch.nn.Module):
         x = self.node_encoder(x)
         x = F.relu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
-
+        
         # List to store intermediate layer outputs (for JK)
         xs = []
 
@@ -126,7 +125,7 @@ class GCN(torch.nn.Module):
                 x = x + x_in
             
             # Store result of this layer
-            xs.append(x)
+            xs.append(x) # 
 
         # Step 3: Jumping Knowledge or Last Layer
         if self.use_jk:
@@ -216,7 +215,7 @@ edge_index = torch.from_numpy(graph['edge_index']).to(torch.long)
 data = Data(x=x, y=y, edge_index=edge_index)
 
 # Transformations: Undirected + SparseTensor
-data = T.ToUndirected()(data)
+data = T.ToUndirected()(data) # 
 data = T.ToSparseTensor()(data)
 
 data = data.to(DEVICE)
@@ -252,7 +251,7 @@ for i, args in enumerate(experiments):
                 args['dropout'],
                 norm_type=args['norm_type'],     
                 use_residual=args['use_residual'],
-                use_jk=args['use_jk'] # NEW: Jumping Knowledge param
+                use_jk=args['use_jk']
                ).to(DEVICE)
     
     # 2. Optimizer & Scheduler
@@ -293,7 +292,25 @@ for i, args in enumerate(experiments):
             best_valid_acc = valid_acc
             best_test_acc = test_acc
             patience_counter = 0
-            torch.save(model.state_dict(), save_path)
+            
+            # --- Robust Saving with Memory Management ---
+            # 1. Clean VRAM/RAM before critical I/O operation
+            if DEVICE == 'cuda':
+                torch.cuda.empty_cache()
+            gc.collect() 
+            
+            # 2. Save the model state
+            try:
+                torch.save(model.state_dict(), save_path)
+            except RuntimeError as e:
+                print(f"\n[CRITICAL I/O WARNING] Failed to save checkpoint at {save_path}: {e}")
+            
+            # 3. Clean VRAM/RAM after I/O operation
+            if DEVICE == 'cuda':
+                torch.cuda.empty_cache()
+            gc.collect()
+            # --- End Robust Saving ---
+            
         else:
             patience_counter += 1
             
